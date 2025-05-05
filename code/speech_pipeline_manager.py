@@ -18,11 +18,6 @@ from colors import Colors
 # (Logging setup)
 logger = logging.getLogger(__name__)
 
-# --- Constants moved from server.py ---
-PROMPT_DIR = "prompts" # Keep PROMPT_DIR definition if needed elsewhere, or remove if only used in server.py now
-# MODE_NAMES removed
-# DEFAULT_MODE removed
-# ---
 
 # System prompt loading is now handled within the SpeechPipelineManager class based on modes.
 USE_ORPHEUS_UNCENSORED = False
