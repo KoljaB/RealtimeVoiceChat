@@ -264,6 +264,21 @@ class LLM:
             self.system_prompt_message = {"role": "system", "content": self.system_prompt}
             logger.info(f"🤖💬 System prompt set.")
 
+    def set_system_prompt(self, new_prompt: Optional[str]):
+        """
+        Updates the system prompt for the LLM instance.
+
+        Args:
+            new_prompt: The new system prompt text, or None to clear it.
+        """
+        logger.info(f"🤖💬 Updating system prompt.")
+        self.system_prompt = new_prompt
+        if self.system_prompt:
+            self.system_prompt_message = {"role": "system", "content": self.system_prompt}
+            logger.debug(f"   New system prompt message set ({len(self.system_prompt)} chars).")
+        else:
+            self.system_prompt_message = None
+            logger.debug("   System prompt message cleared.")
     def _lazy_initialize_clients(self) -> bool:
         """
         Initializes backend clients or checks connections on first use (thread-safe).
@@ -645,7 +660,7 @@ class LLM:
             added_text = text # for normal text
             if self.no_think:
                  # This modification logic remains specific for now
-                added_text = f"{text}/nothink" # for qwen 3
+                added_text = f"{text}" # for qwen 3
             logger.info(f"🧠💬 llm_module.py generate adding role user to messages, content: {added_text}")
             messages.append({"role": "user", "content": added_text})
         logger.debug(f"🤖💬 [{req_id}] Prepared messages count: {len(messages)}")
@@ -1215,7 +1230,7 @@ if __name__ == "__main__":
             ollama_llm = LLM(
                 backend="ollama",
                 model=ollama_model_env,
-                system_prompt="You are concise and helpful."
+                system_prompt="You are concise and helpful./nothink"
             )
 
             # Prewarm will now trigger lazy init WITH the ps check fallback restored
