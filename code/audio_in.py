@@ -163,8 +163,17 @@ class AudioInputProcessor:
                          'pcm' (raw audio bytes) or None to terminate.
         """
         logger.info("👂▶️ Starting audio chunk processing loop.")
+        chunk_counter = 0
+        last_log_time = time.time()
+        
         while True:
             try:
+                # 每10秒记录一次状态
+                current_time = time.time()
+                if current_time - last_log_time > 10:
+                    logger.info(f"👂🔄 音频处理循环仍在运行，已处理 {chunk_counter} 个音频块")
+                    last_log_time = current_time
+                
                 # Check if the transcription task has permanently failed *before* getting item
                 if self._transcription_failed:
                     logger.error("👂🛑 Transcription task failed previously. Stopping audio processing.")
@@ -185,25 +194,36 @@ class AudioInputProcessor:
                         logger.warning("👂⏹️ Transcription task is no longer running (completed or cancelled). Stopping audio processing.")
                         break # Stop processing
 
+                logger.debug("👂⏳ 等待音频队列中的数据...")
                 audio_data = await audio_queue.get()
                 if audio_data is None:
                     logger.info("👂🔌 Received termination signal for audio processing.")
                     break  # Termination signal
 
+                chunk_counter += 1
+                logger.debug(f"👂📦 收到第 {chunk_counter} 个音频块")
+                
                 pcm_data = audio_data.pop("pcm")
+                logger.debug(f"👂📊 音频块大小: {len(pcm_data)} 字节")
 
                 # Process audio chunk (resampling happens consistently via float32)
                 processed = self.process_audio_chunk(pcm_data)
                 if processed.size == 0:
+                    logger.debug("👂🔇 跳过空音频块")
                     continue # Skip empty chunks
 
                 # Feed audio only if not interrupted and transcriber should be running
                 if not self.interrupted:
+                    logger.debug(f"👂🎤 处理音频块 {chunk_counter}，大小: {processed.size} 样本")
                     # Check failure flag again, as it might have been set between queue.get and here
-                     if not self._transcription_failed:
+                    if not self._transcription_failed:
                         # Feed audio to the underlying processor
+                        logger.debug(f"👂➡️ 将音频块 {chunk_counter} 传递给转录器")
                         self.transcriber.feed_audio(processed.tobytes(), audio_data)
-                     # No 'else' needed here because the checks at the start of the loop handle termination
+                    else:
+                        logger.warning(f"👂⚠️ 转录任务已失败，跳过音频块 {chunk_counter}")
+                else:
+                    logger.debug(f"👂⏸️ 音频处理被中断，跳过音频块 {chunk_counter}")
 
             except asyncio.CancelledError:
                 logger.info("👂🚫 Audio processing task cancelled.")

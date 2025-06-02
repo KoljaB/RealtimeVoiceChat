@@ -606,11 +606,34 @@ class SpeechPipelineManager:
                      current_gen.audio_quick_aborted = True
                 else:
                     logger.info(f"🗣️👄🎶 [Gen {gen_id}] Quick TTS Worker: Synthesizing: '{current_gen.quick_answer[:50]}...'")
-                    completed = self.audio.synthesize(
-                        current_gen.quick_answer,
-                        current_gen.audio_chunks,
-                        self.stop_tts_quick_request_event # Pass the event for the synthesizer to check
-                    )
+                    
+                    # 根据TTS引擎选择不同的处理方式
+                    if self.tts_engine == "chatterbox":
+                        # Chatterbox特定的处理逻辑
+                        logger.info(f"🗣️👄🎶 [Gen {gen_id}] Using Chatterbox engine for synthesis")
+                        
+                        # 准备Chatterbox特定参数
+                        chatterbox_kwargs = {
+                            "generation_string": f"[Gen {gen_id}] Chatterbox Quick"
+                        }
+                        
+                        # 检查是否有voice_preset
+                        if hasattr(self, 'voice_preset') and self.voice_preset:
+                            chatterbox_kwargs["voice_preset"] = self.voice_preset
+                        
+                        completed = self.audio.synthesize(
+                            current_gen.quick_answer,
+                            current_gen.audio_chunks,
+                            self.stop_tts_quick_request_event,
+                            **chatterbox_kwargs
+                        )
+                    else:
+                        # 原有的处理逻辑
+                        completed = self.audio.synthesize(
+                            current_gen.quick_answer,
+                            current_gen.audio_chunks,
+                            self.stop_tts_quick_request_event # Pass the event for the synthesizer to check
+                        )
 
                     if not completed:
                         # Synthesis was stopped by the stop_tts_quick_request_event
@@ -732,11 +755,34 @@ class SpeechPipelineManager:
 
             try:
                 logger.info(f"🗣️👄🎶 [Gen {gen_id}] Final TTS Worker: Synthesizing remaining text...")
-                completed = self.audio.synthesize_generator(
-                    get_generator(),
-                    current_gen.audio_chunks,
-                    self.stop_tts_final_request_event # Pass the event for the synthesizer to check
-                )
+                
+                # 根据TTS引擎选择不同的处理方式
+                if self.tts_engine == "chatterbox":
+                    # Chatterbox特定的处理逻辑
+                    logger.info(f"🗣️👄🎶 [Gen {gen_id}] Using Chatterbox engine for final synthesis")
+                    
+                    # 准备Chatterbox特定参数
+                    chatterbox_kwargs = {
+                        "generation_string": f"[Gen {gen_id}] Chatterbox Final"
+                    }
+                    
+                    # 检查是否有voice_preset
+                    if hasattr(self, 'voice_preset') and self.voice_preset:
+                        chatterbox_kwargs["voice_preset"] = self.voice_preset
+                    
+                    completed = self.audio.synthesize_generator(
+                        get_generator(),
+                        current_gen.audio_chunks,
+                        self.stop_tts_final_request_event,
+                        **chatterbox_kwargs
+                    )
+                else:
+                    # 原有的处理逻辑
+                    completed = self.audio.synthesize_generator(
+                        get_generator(),
+                        current_gen.audio_chunks,
+                        self.stop_tts_final_request_event # Pass the event for the synthesizer to check
+                    )
 
                 if not completed:
                      logger.info(f"🗣️👄❌ [Gen {gen_id}] Final TTS Worker: Synthesis stopped via event.")

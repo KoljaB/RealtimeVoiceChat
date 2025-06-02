@@ -9,24 +9,202 @@ from queue import Queue
 from typing import Callable, Generator, Optional
 
 import numpy as np
+import torch
 from huggingface_hub import hf_hub_download
 # Assuming RealtimeTTS is installed and available
-from RealtimeTTS import (CoquiEngine, KokoroEngine, OrpheusEngine,
-                         OrpheusVoice, TextToAudioStream)
+from RealtimeTTS import TextToAudioStream
+# Import Chatterbox
+from chatterbox.tts import ChatterboxTTS
 
 logger = logging.getLogger(__name__)
 
 # Default configuration constants
-START_ENGINE = "kokoro"
+START_ENGINE = "chatterbox"
 Silence = namedtuple("Silence", ("comma", "sentence", "default"))
 ENGINE_SILENCES = {
     "coqui":   Silence(comma=0.3, sentence=0.6, default=0.3),
     "kokoro":  Silence(comma=0.3, sentence=0.6, default=0.3),
     "orpheus": Silence(comma=0.3, sentence=0.6, default=0.3),
+    "chatterbox": Silence(comma=0.3, sentence=0.6, default=0.3),
 }
 # Stream chunk sizes influence latency vs. throughput trade-offs
 QUICK_ANSWER_STREAM_CHUNK_SIZE = 8
 FINAL_ANSWER_STREAM_CHUNK_SIZE = 30
+
+# Chatterbox adapter class to make it compatible with RealtimeTTS interface
+class ChatterboxAdapter:
+    """
+    适配器类，使Chatterbox的API与RealtimeTTS的TextToAudioStream兼容。
+    
+    这个类模拟了RealtimeTTS引擎的接口，但内部使用Chatterbox进行实际的语音合成。
+    它提供了feed、play、play_async和stop等方法，使其可以作为TextToAudioStream的引擎使用。
+    """
+    def __init__(self, model, chunk_size=30, temperature=0.8):
+        """
+        初始化ChatterboxAdapter。
+        
+        Args:
+            model: ChatterboxTTS模型实例
+            chunk_size: 音频块大小，影响延迟和吞吐量
+            temperature: 生成温度，控制随机性
+        """
+        self.model = model
+        self.sr = model.sr
+        self.chunk_size = chunk_size
+        self.temperature = temperature
+        self.text_buffer = ""
+        self.generator = None
+        self.is_playing_flag = False
+        self.on_audio_stream_stop = None
+        self.on_audio_chunk_callback = None
+        self.queue = Queue()  # 添加队列属性，用于与RealtimeTTS兼容
+        
+    def feed(self, text_or_generator):
+        """
+        提供文本或生成器给适配器。
+        
+        Args:
+            text_or_generator: 要合成的文本字符串或文本生成器
+        """
+        if callable(getattr(text_or_generator, "__next__", None)):
+            # 如果是生成器，保存引用
+            self.generator = text_or_generator
+        else:
+            # 如果是文本，保存到缓冲区
+            self.text_buffer = text_or_generator
+            
+    def play(self, **kwargs):
+        """
+        同步播放当前缓冲区中的文本。
+        
+        Args:
+            **kwargs: 播放参数，包括on_audio_chunk回调等
+        """
+        self.on_audio_chunk_callback = kwargs.get("on_audio_chunk")
+        self.is_playing_flag = True
+        
+        try:
+            if self.generator:
+                # 处理生成器输入
+                text = "".join(list(self.generator))
+                self._process_text(text, **kwargs)
+            else:
+                # 处理文本输入
+                self._process_text(self.text_buffer, **kwargs)
+        finally:
+            self.is_playing_flag = False
+            if self.on_audio_stream_stop:
+                self.on_audio_stream_stop()
+                
+    def play_async(self, **kwargs):
+        """
+        异步播放当前缓冲区中的文本。
+        
+        Args:
+            **kwargs: 播放参数，包括on_audio_chunk回调等
+        """
+        self.on_audio_chunk_callback = kwargs.get("on_audio_chunk")
+        self.is_playing_flag = True
+        
+        # 在新线程中运行同步播放方法
+        threading.Thread(
+            target=self._play_thread,
+            args=(kwargs,),
+            daemon=True
+        ).start()
+    
+    def _play_thread(self, kwargs):
+        """线程函数，用于异步播放"""
+        try:
+            if self.generator:
+                # 处理生成器输入
+                accumulated_text = ""
+                for text_chunk in self.generator:
+                    if not self.is_playing_flag:
+                        break
+                    accumulated_text += text_chunk
+                    self._process_text(text_chunk, **kwargs)
+            else:
+                # 处理文本输入
+                self._process_text(self.text_buffer, **kwargs)
+        finally:
+            self.is_playing_flag = False
+            if self.on_audio_stream_stop:
+                self.on_audio_stream_stop()
+    
+    def _process_text(self, text, **kwargs):
+        """
+        处理文本并生成音频块。
+        
+        Args:
+            text: 要处理的文本
+            **kwargs: 处理参数
+        """
+        if not text.strip():
+            return
+            
+        stream_params = {
+            'chunk_size': self.chunk_size,
+            'temperature': self.temperature,
+            'print_metrics': False,
+        }
+        
+        # 从kwargs中提取Chatterbox特有的参数
+        if 'audio_prompt_path' in kwargs:
+            stream_params['audio_prompt_path'] = kwargs['audio_prompt_path']
+        if 'exaggeration' in kwargs:
+            stream_params['exaggeration'] = kwargs['exaggeration']
+        if 'cfg_weight' in kwargs:
+            stream_params['cfg_weight'] = kwargs['cfg_weight']
+        
+        try:
+            # 使用Chatterbox生成音频流
+            logging.info(f"开始Chatterbox音频流生成，文本长度: {len(text)}")
+            chunk_count = 0
+            for audio_chunk, _ in self.model.generate_stream(text, **stream_params):
+                chunk_count += 1
+                if not self.is_playing_flag:
+                    logging.info("Chatterbox生成中断，is_playing_flag为False")
+                    break
+                    
+                # 转换为numpy数组并传递给回调
+                audio_data = audio_chunk.cpu().numpy().squeeze()
+                
+                # 确保音频数据在[-1, 1]范围内
+                if audio_data.max() > 1.0 or audio_data.min() < -1.0:
+                    audio_data = np.clip(audio_data, -1.0, 1.0)
+                
+                # 转换为字节格式以与RealtimeTTS兼容
+                audio_bytes = audio_data.tobytes()
+                
+                if self.on_audio_chunk_callback:
+                    logging.debug(f"Chatterbox生成第{chunk_count}个音频块，大小: {len(audio_bytes)} 字节")
+                    self.on_audio_chunk_callback(audio_bytes)
+                else:
+                    logging.warning("Chatterbox生成音频块，但on_audio_chunk_callback未设置")
+            
+            logging.info(f"Chatterbox音频流生成完成，共生成{chunk_count}个音频块")
+        except Exception as e:
+            logging.error(f"Chatterbox生成过程中出错: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+    
+    def stop(self):
+        """停止当前播放"""
+        self.is_playing_flag = False
+        
+    def is_playing(self):
+        """返回当前是否正在播放"""
+        return self.is_playing_flag
+        
+    def get_stream_info(self):
+        """
+        返回音频流的格式、通道数和采样率信息。
+        
+        Returns:
+            tuple: (format, channels, rate) 音频格式、通道数和采样率
+        """
+        return "pcm", 1, self.sr  # 返回PCM格式，单声道，使用模型的采样率
 
 # Coqui model download helper functions
 def create_directory(path: str) -> None:
@@ -102,54 +280,78 @@ class AudioProcessor:
         self.current_stream_chunk_size = QUICK_ANSWER_STREAM_CHUNK_SIZE # Initial chunk size
 
         # Dynamically load and configure the selected TTS engine
-        if engine == "coqui":
-            ensure_lasinya_models(models_root="models", model_name="Lasinya")
-            self.engine = CoquiEngine(
-                specific_model="Lasinya",
-                local_models_path="./models",
-                voice="reference_audio.wav",
-                speed=1.1,
-                use_deepspeed=True,
-                thread_count=6,
-                stream_chunk_size=self.current_stream_chunk_size,
-                overlap_wav_len=1024,
-                load_balancing=True,
-                load_balancing_buffer_length=0.5,
-                load_balancing_cut_off=0.1,
-                add_sentence_filter=True,
+        # if engine == "coqui":
+        #     ensure_lasinya_models(models_root="models", model_name="Lasinya")
+        #     self.engine = CoquiEngine(
+        #         specific_model="Lasinya",
+        #         local_models_path="./models",
+        #         voice="reference_audio.wav",
+        #         speed=1.1,
+        #         use_deepspeed=True,
+        #         thread_count=6,
+        #         stream_chunk_size=self.current_stream_chunk_size,
+        #         overlap_wav_len=1024,
+        #         load_balancing=True,
+        #         load_balancing_buffer_length=0.5,
+        #         load_balancing_cut_off=0.1,
+        #         add_sentence_filter=True,
+        #     )
+        # elif engine == "kokoro":
+        #     self.engine = KokoroEngine(
+        #         voice="af_heart",
+        #         default_speed=1.26,
+        #         trim_silence=True,
+        #         silence_threshold=0.01,
+        #         extra_start_ms=25,
+        #         extra_end_ms=15,
+        #         fade_in_ms=15,
+        #         fade_out_ms=10,
+        #     )
+        # elif engine == "orpheus":
+        #     self.engine = OrpheusEngine(
+        #         model=self.orpheus_model,
+        #         temperature=0.8,
+        #         top_p=0.95,
+        #         repetition_penalty=1.1,
+        #         max_tokens=1200,
+        #     )
+        #     voice = OrpheusVoice("tara")
+        #     self.engine.set_voice(voice)
+        if engine == "chatterbox":
+            # 创建Chatterbox模型
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cpu":
+                logger.warning("CUDA不可用，Chatterbox将在CPU上运行，性能可能受到影响")
+            
+            chatterbox_model = ChatterboxTTS.from_pretrained(
+                device=device
             )
-        elif engine == "kokoro":
-            self.engine = KokoroEngine(
-                voice="af_heart",
-                default_speed=1.26,
-                trim_silence=True,
-                silence_threshold=0.01,
-                extra_start_ms=25,
-                extra_end_ms=15,
-                fade_in_ms=15,
-                fade_out_ms=10,
+            # 使用适配器包装模型
+            self.engine = ChatterboxAdapter(
+                model=chatterbox_model,
+                chunk_size=30,  # 可以根据需要调整
+                temperature=0.8
             )
-        elif engine == "orpheus":
-            self.engine = OrpheusEngine(
-                model=self.orpheus_model,
-                temperature=0.8,
-                top_p=0.95,
-                repetition_penalty=1.1,
-                max_tokens=1200,
-            )
-            voice = OrpheusVoice("tara")
-            self.engine.set_voice(voice)
+            self.sr = self.engine.sr
+            self.tts_engine = engine  # 保存引擎类型，用于cleanup_resources
         else:
             raise ValueError(f"Unsupported engine: {engine}")
 
 
-        # Initialize the RealtimeTTS stream
-        self.stream = TextToAudioStream(
-            self.engine,
-            muted=True, # Do not play audio directly
-            playout_chunk_size=4096, # Internal chunk size for processing
-            on_audio_stream_stop=self.on_audio_stream_stop,
-        )
+        # 为Chatterbox引擎创建自定义初始化逻辑
+        if self.engine_name == "chatterbox":
+            # 直接使用ChatterboxAdapter，不通过TextToAudioStream
+            # 因为TextToAudioStream期望引擎有特定的接口
+            self.stream = self.engine
+            self.stream.on_audio_stream_stop = self.on_audio_stream_stop
+        else:
+            # 对于其他引擎，使用标准的TextToAudioStream
+            self.stream = TextToAudioStream(
+                self.engine,
+                muted=True, # Do not play audio directly
+                playout_chunk_size=4096, # Internal chunk size for processing
+                on_audio_stream_stop=self.on_audio_stream_stop,
+            )
 
         # Ensure Coqui engine starts with the quick chunk size
         if self.engine_name == "coqui" and hasattr(self.engine, 'set_stream_chunk_size') and self.current_stream_chunk_size != QUICK_ANSWER_STREAM_CHUNK_SIZE:
@@ -158,61 +360,68 @@ class AudioProcessor:
             self.current_stream_chunk_size = QUICK_ANSWER_STREAM_CHUNK_SIZE
 
         # Prewarm the engine
-        self.stream.feed("prewarm")
-        play_kwargs = dict(
-            log_synthesized_text=False, # Don't log prewarm text
-            muted=True,
-            fast_sentence_fragment=False,
-            comma_silence_duration=self.silence.comma,
-            sentence_silence_duration=self.silence.sentence,
-            default_silence_duration=self.silence.default,
-            force_first_fragment_after_words=999999, # Effectively disable this
-        )
-        self.stream.play(**play_kwargs) # Synchronous play for prewarm
-        # Wait for prewarm to finish (indicated by on_audio_stream_stop)
-        while self.stream.is_playing():
-            time.sleep(0.01)
-        self.finished_event.wait() # Wait for stop callback
-        self.finished_event.clear()
-
-        # Measure Time To First Audio (TTFA)
-        start_time = time.time()
-        ttfa = None
-        def on_audio_chunk_ttfa(chunk: bytes):
-            nonlocal ttfa
-            if ttfa is None:
-                ttfa = time.time() - start_time
-                logger.debug(f"👄⏱️ TTFA measurement first chunk arrived, TTFA: {ttfa:.2f}s.")
-
-        self.stream.feed("This is a test sentence to measure the time to first audio chunk.")
-        play_kwargs_ttfa = dict(
-            on_audio_chunk=on_audio_chunk_ttfa,
-            log_synthesized_text=False, # Don't log test sentence
-            muted=True,
-            fast_sentence_fragment=False,
-            comma_silence_duration=self.silence.comma,
-            sentence_silence_duration=self.silence.sentence,
-            default_silence_duration=self.silence.default,
-            force_first_fragment_after_words=999999,
-        )
-        self.stream.play_async(**play_kwargs_ttfa)
-
-        # Wait until the first chunk arrives or stream finishes
-        while ttfa is None and (self.stream.is_playing() or not self.finished_event.is_set()):
-            time.sleep(0.01)
-        self.stream.stop() # Ensure stream stops cleanly
-
-        # Wait for stop callback if it hasn't fired yet
-        if not self.finished_event.is_set():
-            self.finished_event.wait(timeout=2.0) # Add timeout for safety
-        self.finished_event.clear()
-
-        if ttfa is not None:
-            logger.debug(f"👄⏱️ TTFA measurement complete. TTFA: {ttfa:.2f}s.")
-            self.tts_inference_time = ttfa * 1000  # Store as ms
+        if self.engine_name == "chatterbox":
+            # Chatterbox引擎的预热逻辑
+            logger.info("👄🔥 预热Chatterbox引擎")
+            # 简化的预热过程，直接设置一个合理的推断时间
+            self.tts_inference_time = 500  # 假设500ms的推断时间
         else:
-            logger.warning("👄⚠️ TTFA measurement failed (no audio chunk received).")
-            self.tts_inference_time = 0
+            # 原有引擎的预热逻辑
+            self.stream.feed("prewarm")
+            play_kwargs = dict(
+                log_synthesized_text=False, # Don't log prewarm text
+                muted=True,
+                fast_sentence_fragment=False,
+                comma_silence_duration=self.silence.comma,
+                sentence_silence_duration=self.silence.sentence,
+                default_silence_duration=self.silence.default,
+                force_first_fragment_after_words=999999, # Effectively disable this
+            )
+            self.stream.play(**play_kwargs) # Synchronous play for prewarm
+            # Wait for prewarm to finish (indicated by on_audio_stream_stop)
+            while self.stream.is_playing():
+                time.sleep(0.01)
+            self.finished_event.wait() # Wait for stop callback
+            self.finished_event.clear()
+
+            # Measure Time To First Audio (TTFA)
+            start_time = time.time()
+            ttfa = None
+            def on_audio_chunk_ttfa(chunk: bytes):
+                nonlocal ttfa
+                if ttfa is None:
+                    ttfa = time.time() - start_time
+                    logger.debug(f"👄⏱️ TTFA measurement first chunk arrived, TTFA: {ttfa:.2f}s.")
+
+            self.stream.feed("This is a test sentence to measure the time to first audio chunk.")
+            play_kwargs_ttfa = dict(
+                on_audio_chunk=on_audio_chunk_ttfa,
+                log_synthesized_text=False, # Don't log test sentence
+                muted=True,
+                fast_sentence_fragment=False,
+                comma_silence_duration=self.silence.comma,
+                sentence_silence_duration=self.silence.sentence,
+                default_silence_duration=self.silence.default,
+                force_first_fragment_after_words=999999,
+            )
+            self.stream.play_async(**play_kwargs_ttfa)
+
+            # Wait until the first chunk arrives or stream finishes
+            while ttfa is None and (self.stream.is_playing() or not self.finished_event.is_set()):
+                time.sleep(0.01)
+            self.stream.stop() # Ensure stream stops cleanly
+
+            # Wait for stop callback if it hasn't fired yet
+            if not self.finished_event.is_set():
+                self.finished_event.wait(timeout=2.0) # Add timeout for safety
+            self.finished_event.clear()
+
+            if ttfa is not None:
+                logger.debug(f"👄⏱️ TTFA measurement complete. TTFA: {ttfa:.2f}s.")
+                self.tts_inference_time = ttfa * 1000  # Store as ms
+            else:
+                logger.warning("👄⚠️ TTFA measurement failed (no audio chunk received).")
+                self.tts_inference_time = 0
 
         # Callbacks to be set externally if needed
         self.on_first_audio_chunk_synthesize: Optional[Callable[[], None]] = None
@@ -226,13 +435,102 @@ class AudioProcessor:
         logger.info("👄🛑 Audio stream stopped.")
         self.finished_event.set()
 
+    def _synthesize_chatterbox(
+        self,
+        text: str,
+        audio_chunks: Queue,
+        stop_event: threading.Event,
+        generation_string: str = "",
+    ) -> bool:
+        """
+        为Chatterbox引擎专门实现的合成方法。
+        
+        由于Chatterbox引擎与RealtimeTTS的接口不完全兼容，这个方法提供了一个直接使用
+        ChatterboxAdapter的替代实现。
+        
+        Args:
+            text: 要合成的文本字符串。
+            audio_chunks: 用于存放生成的音频块的队列。
+            stop_event: 用于中断合成的事件。
+            generation_string: 用于日志记录的可选标识符字符串。
+            
+        Returns:
+            如果合成完全完成则返回True，如果被stop_event中断则返回False。
+        """
+        logger.info(f"👄🔊 {generation_string} Chatterbox开始合成: {text[:50]}...")
+        self.finished_event.clear()  # 在开始前重置完成事件
+        
+        # 定义音频块回调函数
+        def on_audio_chunk(chunk: bytes):
+            # 检查中断信号
+            if stop_event.is_set():
+                logger.info(f"👄🛑 {generation_string} Chatterbox音频流被stop_event中断。")
+                return
+                
+            # 第一个音频块的处理
+            if not hasattr(on_audio_chunk, "first_chunk_received"):
+                on_audio_chunk.first_chunk_received = True
+                logger.info(f"👄🎵 {generation_string} Chatterbox第一个音频块已接收")
+                
+                # 触发第一个块回调（如果设置了）
+                if self.on_first_audio_chunk_synthesize:
+                    logger.info(f"👄🎵 {generation_string} 触发第一个音频块回调")
+                    self.on_first_audio_chunk_synthesize()
+            
+            # 将音频块放入队列
+            try:
+                audio_chunks.put_nowait(chunk)
+                logger.debug(f"👄➡️ {generation_string} 音频块已放入队列，大小: {len(chunk)} 字节")
+            except asyncio.QueueFull:
+                logger.warning(f"👄⚠️ {generation_string} Chatterbox音频队列已满，丢弃块。")
+        
+        # 设置回调
+        self.engine.on_audio_chunk_callback = on_audio_chunk
+        
+        # 提供文本给引擎
+        logger.info(f"👄📝 {generation_string} 提供文本给Chatterbox引擎: {text[:50]}...")
+        self.engine.feed(text)
+        
+        # 异步播放（实际上是合成，因为我们设置了muted=True）
+        logger.info(f"👄▶️ {generation_string} 开始Chatterbox异步合成")
+        self.engine.play_async(
+            on_audio_chunk=on_audio_chunk,
+            muted=True
+        )
+        
+        # 等待合成完成或被中断
+        logger.info(f"👄⏳ {generation_string} 等待Chatterbox合成完成...")
+        wait_start = time.time()
+        while self.engine.is_playing() and not stop_event.is_set():
+            time.sleep(0.01)
+            # 每隔5秒记录一次等待状态
+            if time.time() - wait_start > 5:
+                logger.info(f"👄⏳ {generation_string} 仍在等待Chatterbox合成完成...")
+                wait_start = time.time()
+            
+        # 如果被中断，停止引擎
+        if stop_event.is_set():
+            logger.info(f"👄🛑 {generation_string} Chatterbox合成被中断")
+            self.engine.stop()
+            return False
+            
+        # 等待完成回调触发
+        if not self.finished_event.is_set():
+            logger.info(f"👄⏳ {generation_string} 等待完成回调触发...")
+            self.finished_event.wait(timeout=2.0)  # 添加超时以确保安全
+            if not self.finished_event.is_set():
+                logger.warning(f"👄⚠️ {generation_string} 完成回调超时")
+        self.finished_event.clear()
+        
+        logger.info(f"👄✅ {generation_string} Chatterbox合成完成")
+        return True
     def synthesize(
-            self,
-            text: str,
-            audio_chunks: Queue, 
-            stop_event: threading.Event,
-            generation_string: str = "",
-        ) -> bool:
+        self,
+        text: str,
+        audio_chunks: Queue,
+        stop_event: threading.Event,
+        generation_string: str = "",
+    ) -> bool:
         """
         Synthesizes audio from a complete text string and puts chunks into a queue.
 
@@ -253,6 +551,11 @@ class AudioProcessor:
         Returns:
             True if synthesis completed fully, False if interrupted by stop_event.
         """
+        # 针对Chatterbox引擎的特殊处理
+        if self.engine_name == "chatterbox":
+            return self._synthesize_chatterbox(text, audio_chunks, stop_event, generation_string)
+            
+        # 原有引擎的处理逻辑
         if self.engine_name == "coqui" and hasattr(self.engine, 'set_stream_chunk_size') and self.current_stream_chunk_size != QUICK_ANSWER_STREAM_CHUNK_SIZE:
             logger.info(f"👄⚙️ {generation_string} Setting Coqui stream chunk size to {QUICK_ANSWER_STREAM_CHUNK_SIZE} for quick synthesis.")
             self.engine.set_stream_chunk_size(QUICK_ANSWER_STREAM_CHUNK_SIZE)
@@ -407,12 +710,12 @@ class AudioProcessor:
         return True # Indicate successful completion
 
     def synthesize_generator(
-            self,
-            generator: Generator[str, None, None],
-            audio_chunks: Queue, # Should match self.audio_chunks type
-            stop_event: threading.Event,
-            generation_string: str = "",
-        ) -> bool:
+        self,
+        generator: Generator[str, None, None],
+        audio_chunks: Queue, # Should match self.audio_chunks type
+        stop_event: threading.Event,
+        generation_string: str = "",
+    ) -> bool:
         """
         Synthesizes audio from a generator yielding text chunks and puts audio into a queue.
 
@@ -583,3 +886,9 @@ class AudioProcessor:
 
         logger.info(f"👄✅ {generation_string} Final answer synthesis complete.")
         return True # Indicate successful completion
+        
+    def cleanup_resources(self):
+        """清理资源，特别是GPU内存"""
+        if hasattr(self, 'tts_engine') and self.tts_engine == "chatterbox" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("已清理CUDA缓存")

@@ -33,14 +33,18 @@ TTS_START_ENGINE = "kokoro"
 TTS_START_ENGINE = "coqui"
 TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
 TTS_ORPHEUS_MODEL = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
+TTS_CHATTERBOX_MODEL = "ResembleAI/chatterbox"
+TTS_START_ENGINE = "chatterbox"  
+TTS_CHATTERBOX_CHUNK_SIZE = 30  # 针对快速响应优化
+
 
 LLM_START_PROVIDER = "ollama"
-#LLM_START_MODEL = "qwen3:30b-a3b"
-LLM_START_MODEL = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF:Q4_K_M"
+#LLM_START_MODEL = "qwen3:30b-a3b"h
+LLM_START_MODEL = "qwen3:8b"
 # LLM_START_PROVIDER = "lmstudio"
 # LLM_START_MODEL = "Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q3_K_L.gguf"
 NO_THINK = False
-DIRECT_STREAM = TTS_START_ENGINE=="orpheus"
+DIRECT_STREAM = TTS_START_ENGINE=="chatterbox"
 
 if __name__ == "__main__":
     logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Starting engine: {Colors.apply(TTS_START_ENGINE).blue}")
@@ -121,7 +125,7 @@ async def lifespan(app: FastAPI):
         llm_provider=LLM_START_PROVIDER,
         llm_model=LLM_START_MODEL,
         no_think=NO_THINK,
-        orpheus_model=TTS_ORPHEUS_MODEL,
+        orpheus_model=TTS_CHATTERBOX_MODEL,
     )
 
     app.state.Upsampler = UpsampleOverlap()
@@ -247,9 +251,19 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
     """
     try:
         while True:
+            logger.debug("🖥️⏳ 等待从WebSocket接收消息...")
             msg = await ws.receive()
+            
+            # 检查是否收到断开连接消息
+            if msg.get("type") == "websocket.disconnect":
+                logger.info("🖥️🔌 Received disconnect message from client.")
+                break
+            
+            logger.debug(f"🖥️📥 收到消息类型: {msg.get('type', 'unknown')}")
+                
             if "bytes" in msg and msg["bytes"]:
                 raw = msg["bytes"]
+                logger.info(f"🖥️📦 收到二进制数据，大小: {len(raw)} 字节")
 
                 # Ensure we have at least an 8‑byte header: 4 bytes timestamp_ms + 4 bytes flags
                 if len(raw) < 8:
@@ -259,6 +273,7 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 # Unpack big‑endian uint32 timestamp (ms) and uint32 flags
                 timestamp_ms, flags = struct.unpack("!II", raw[:8])
                 client_sent_ns = timestamp_ms * 1_000_000
+                logger.debug(f"🖥️⏱️ 客户端时间戳: {timestamp_ms} ms, 标志: {flags}")
 
                 # Build metadata using fixed fields
                 metadata = {
@@ -267,6 +282,8 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                     "client_sent_formatted":    format_timestamp_ns(client_sent_ns),
                     "isTTSPlaying":             bool(flags & 1),
                 }
+                
+                logger.debug(f"🖥️🎧 TTS播放状态: {'播放中' if bool(flags & 1) else '未播放'}")
 
                 # Record server receive time
                 server_ns = time.time_ns()
@@ -274,13 +291,17 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 metadata["server_received_formatted"] = format_timestamp_ns(server_ns)
 
                 # The rest of the payload is raw PCM bytes
-                metadata["pcm"] = raw[8:]
+                pcm_data = raw[8:]
+                metadata["pcm"] = pcm_data
+                logger.info(f"🖥️🎤 收到音频数据，大小: {len(pcm_data)} 字节")
 
                 # Check queue size before putting data
                 current_qsize = incoming_chunks.qsize()
                 if current_qsize < MAX_AUDIO_QUEUE_SIZE:
                     # Now put only the metadata dict (containing PCM audio) into the processing queue.
+                    logger.info(f"🖥️➡️ 将音频数据放入处理队列，队列大小: {current_qsize}/{MAX_AUDIO_QUEUE_SIZE}")
                     await incoming_chunks.put(metadata)
+                    logger.debug("🖥️✅ 音频数据成功放入队列")
                 else:
                     # Queue is full, drop the chunk and log a warning
                     logger.warning(
@@ -464,35 +485,75 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
                 log_status()
                 continue
 
-            chunk = None
-            try:
-                chunk = app.state.SpeechPipelineManager.running_generation.audio_chunks.get_nowait()
+            # 根据是否使用直接流式传输选择不同的处理方式
+            if DIRECT_STREAM:
+                # Chatterbox直接流式传输处理
+                chunk = None
+                try:
+                    chunk = app.state.SpeechPipelineManager.running_generation.audio_chunks.get_nowait()
+                    if chunk:
+                        last_quick_answer_chunk = time.time()
+                except Empty:
+                    final_expected = app.state.SpeechPipelineManager.running_generation.quick_answer_provided
+                    audio_final_finished = app.state.SpeechPipelineManager.running_generation.audio_final_finished
+
+                    if not final_expected or audio_final_finished:
+                        logger.info("🖥️🏁 Sending of TTS chunks and 'user request/assistant answer' cycle finished.")
+                        callbacks.send_final_assistant_answer() # Callbacks method
+
+                        assistant_answer = app.state.SpeechPipelineManager.running_generation.quick_answer + app.state.SpeechPipelineManager.running_generation.final_answer
+                        app.state.SpeechPipelineManager.running_generation = None
+
+                        callbacks.tts_chunk_sent = False # Reset via callbacks
+                        callbacks.reset_state() # Reset connection state via callbacks
+
+                    await asyncio.sleep(0.001)
+                    log_status()
+                    continue
+
+                # 直接发送Chatterbox音频块，无需上采样
                 if chunk:
-                    last_quick_answer_chunk = time.time()
-            except Empty:
-                final_expected = app.state.SpeechPipelineManager.running_generation.quick_answer_provided
-                audio_final_finished = app.state.SpeechPipelineManager.running_generation.audio_final_finished
+                    import base64
+                    # 将音频数据转换为base64编码
+                    base64_chunk = base64.b64encode(chunk).decode('utf-8')
+                    message_queue.put_nowait({
+                        "type": "tts_chunk",
+                        "content": base64_chunk,
+                        "direct_stream": True,
+                        "sample_rate": 24000  # Chatterbox的采样率
+                    })
+                    last_chunk_sent = time.time()
+            else:
+                # 原有的RealtimeTTS处理流程
+                chunk = None
+                try:
+                    chunk = app.state.SpeechPipelineManager.running_generation.audio_chunks.get_nowait()
+                    if chunk:
+                        last_quick_answer_chunk = time.time()
+                except Empty:
+                    final_expected = app.state.SpeechPipelineManager.running_generation.quick_answer_provided
+                    audio_final_finished = app.state.SpeechPipelineManager.running_generation.audio_final_finished
 
-                if not final_expected or audio_final_finished:
-                    logger.info("🖥️🏁 Sending of TTS chunks and 'user request/assistant answer' cycle finished.")
-                    callbacks.send_final_assistant_answer() # Callbacks method
+                    if not final_expected or audio_final_finished:
+                        logger.info("🖥️🏁 Sending of TTS chunks and 'user request/assistant answer' cycle finished.")
+                        callbacks.send_final_assistant_answer() # Callbacks method
 
-                    assistant_answer = app.state.SpeechPipelineManager.running_generation.quick_answer + app.state.SpeechPipelineManager.running_generation.final_answer                    
-                    app.state.SpeechPipelineManager.running_generation = None
+                        assistant_answer = app.state.SpeechPipelineManager.running_generation.quick_answer + app.state.SpeechPipelineManager.running_generation.final_answer
+                        app.state.SpeechPipelineManager.running_generation = None
 
-                    callbacks.tts_chunk_sent = False # Reset via callbacks
-                    callbacks.reset_state() # Reset connection state via callbacks
+                        callbacks.tts_chunk_sent = False # Reset via callbacks
+                        callbacks.reset_state() # Reset connection state via callbacks
 
-                await asyncio.sleep(0.001)
-                log_status()
-                continue
+                    await asyncio.sleep(0.001)
+                    log_status()
+                    continue
 
-            base64_chunk = app.state.Upsampler.get_base64_chunk(chunk)
-            message_queue.put_nowait({
-                "type": "tts_chunk",
-                "content": base64_chunk
-            })
-            last_chunk_sent = time.time()
+                base64_chunk = app.state.Upsampler.get_base64_chunk(chunk)
+                message_queue.put_nowait({
+                    "type": "tts_chunk",
+                    "content": base64_chunk
+                })
+                last_chunk_sent = time.time()
 
             # Use connection-specific state via callbacks
             if not callbacks.tts_chunk_sent:
@@ -613,11 +674,14 @@ class TranscriptionCallbacks:
         Args:
             txt: The partial transcription text.
         """
+        logger.info(f"🖥️👂 收到部分转录结果: '{txt}'")
         self.final_assistant_answer_sent = False # New user speech invalidates previous final answer sending state
         self.final_transcription = "" # Clear final transcription as this is partial
         self.partial_transcription = txt
+        logger.info("🖥️📤 发送部分用户请求到客户端")
         self.message_queue.put_nowait({"type": "partial_user_request", "content": txt})
         self.abort_text = txt # Update text used for abort check
+        logger.debug("🖥️🔄 触发中断检查")
         self.abort_request_event.set() # Signal the abort worker
 
     def safe_abort_running_syntheses(self, reason: str):
@@ -641,9 +705,11 @@ class TranscriptionCallbacks:
         Args:
             txt: The potential sentence text.
         """
-        logger.debug(f"🖥️🧠 Potential sentence: '{txt}'")
+        logger.info(f"🖥️🧠 检测到潜在完整句子: '{txt}'")
         # Access global manager state
+        logger.info(f"🖥️🚀 准备生成对句子的响应: '{txt}'")
         self.app.state.SpeechPipelineManager.prepare_generation(txt)
+        logger.info(f"🖥️✅ 已触发语音生成准备")
 
     def on_potential_final(self, txt: str):
         """

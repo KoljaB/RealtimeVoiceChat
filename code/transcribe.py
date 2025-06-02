@@ -787,19 +787,38 @@ class TranscriptionProcessor:
             audio_meta_data: Optional dictionary containing metadata about the audio
                              (e.g., sample rate, channels), if required by the recorder.
         """
+        # 记录音频块信息和元数据
+        chunk_size = len(chunk)
+        logger.info(f"👂🔊 接收到音频块，大小: {chunk_size} 字节")
+        
+        # 记录元数据信息
+        if audio_meta_data:
+            logger.info(f"👂📋 音频元数据: {audio_meta_data}")
+            
+            # 更新静音时间（如果提供）
+            if "speech_end_silence_start" in audio_meta_data:
+                old_silence_time = self.silence_time
+                self.silence_time = audio_meta_data["speech_end_silence_start"]
+                if old_silence_time != self.silence_time:
+                    logger.info(f"👂⏱️ 更新静音时间: {old_silence_time} -> {self.silence_time}")
+        
         if self.recorder and not self.shutdown_performed:
             try:
                 # Check if feed_audio expects metadata and provide if available
                 if START_STT_SERVER:
                      # Client might require metadata in a specific format
+                     logger.info(f"👂➡️ 将音频块传递给STT服务器，大小: {chunk_size} 字节")
                      self.recorder.feed_audio(chunk) # Assuming client handles metadata internally or doesn't need it per chunk
                 else:
                      # Local recorder might use metadata if provided
+                     logger.info(f"👂➡️ 将音频块传递给本地录音器，大小: {chunk_size} 字节")
                      self.recorder.feed_audio(chunk) # Assuming local handles it similarly for now
 
-                logger.debug(f"👂🔊 Fed audio chunk of size {len(chunk)} bytes to recorder.")
+                logger.info(f"👂✅ 音频块成功传递给录音器，大小: {chunk_size} 字节")
             except Exception as e:
                 logger.error(f"👂💥 Error feeding audio to recorder: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
         elif not self.recorder:
             logger.warning("👂⚠️ Cannot feed audio: Recorder not initialized.")
         elif self.shutdown_performed:
