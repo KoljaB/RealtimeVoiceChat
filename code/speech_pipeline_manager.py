@@ -7,7 +7,7 @@ from queue import Queue, Empty
 import sys
 
 # (Make sure real/mock imports are correct)
-from audio_module import AudioProcessor
+from audio_module import ChatterboxAudioProcessor
 from text_similarity import TextSimilarity
 from text_context import TextContext
 from llm_module import LLM
@@ -26,22 +26,10 @@ except FileNotFoundError:
     system_prompt = "You are a helpful assistant."
 
 
-USE_ORPHEUS_UNCENSORED = False
-
-orpheus_prompt_addon_normal = """
-When expressing emotions, you are ONLY allowed to use the following exact tags (including the spaces):
-" <laugh> ", " <chuckle> ", " <sigh> ", " <cough> ", " <sniffle> ", " <groan> ", " <yawn> ", and " <gasp> ".
-
-Do NOT create or use any other emotion tags. Do NOT remove the spaces. Use these tags exactly as shown, and only when appropriate.
-""".strip()
-
-orpheus_prompt_addon_uncensored = """
-When expressing emotions, you are ONLY allowed to use the following exact tags (including the spaces):
-" <moans> ", " <panting> ", " <grunting> ", " <gagging sounds> ", " <chokeing> ", " <kissing noises> ", " <laugh> ", " <chuckle> ", " <sigh> ", " <cough> ", " <sniffle> ", " <groan> ", " <yawn> ", " <gasp> ".
-Do NOT create or use any other emotion tags. Do NOT remove the spaces. Use these tags exactly as shown, and only when appropriate.
-""".strip()
-
-orpheus_prompt_addon = orpheus_prompt_addon_uncensored if USE_ORPHEUS_UNCENSORED else orpheus_prompt_addon_normal
+# TTS配置常量
+TTS_ENGINE = "chatterbox"
+TTS_CHUNK_SIZE = 25
+TTS_TEMPERATURE = 0.8
 
 
 class PipelineRequest:
@@ -121,40 +109,39 @@ class SpeechPipelineManager:
     """
     def __init__(
             self,
-            tts_engine: str = "kokoro",
             llm_provider: str = "ollama",
             llm_model: str = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF:Q4_K_M",
             no_think: bool = False,
-            orpheus_model: str = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf",
+            tts_chunk_size: int = TTS_CHUNK_SIZE,
+            tts_temperature: float = TTS_TEMPERATURE,
         ):
         """
         Initializes the SpeechPipelineManager.
 
-        Sets up configuration, instantiates dependencies (AudioProcessor, LLM, etc.),
+        Sets up configuration, instantiates dependencies (ChatterboxAudioProcessor, LLM, etc.),
         loads system prompts, initializes state variables (queues, events, flags),
         measures initial inference latencies, and starts the background worker threads.
 
         Args:
-            tts_engine: The TTS engine to use (e.g., "kokoro", "orpheus").
             llm_provider: The LLM backend provider (e.g., "ollama").
             llm_model: The specific LLM model identifier.
             no_think: If True, removes specific thinking tags from LLM output.
-            orpheus_model: Path or identifier for the Orpheus TTS model, if used.
+            tts_chunk_size: Chunk size for TTS streaming.
+            tts_temperature: Temperature for TTS generation.
         """
-        self.tts_engine = tts_engine
+        self.tts_engine = TTS_ENGINE
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.no_think = no_think
-        self.orpheus_model = orpheus_model
+        self.tts_chunk_size = tts_chunk_size
+        self.tts_temperature = tts_temperature
 
         self.system_prompt = system_prompt
-        if tts_engine == "orpheus":
-            self.system_prompt += f"\n{orpheus_prompt_addon}"
 
         # --- Instance Dependencies ---
-        self.audio = AudioProcessor(
-            engine=self.tts_engine,
-            orpheus_model=self.orpheus_model
+        self.audio = ChatterboxAudioProcessor(
+            chunk_size=self.tts_chunk_size,
+            temperature=self.tts_temperature
         )
         self.audio.on_first_audio_chunk_synthesize = self.on_first_audio_chunk_synthesize
         self.text_similarity = TextSimilarity(focus='end', n_words=5)
@@ -211,8 +198,10 @@ class SpeechPipelineManager:
 
         self.on_partial_assistant_text: Optional[Callable[[str], None]] = None
 
-        self.full_output_pipeline_latency = self.llm_inference_time + self.audio.tts_inference_time
-        logger.info(f"🗣️⏱️ Full output pipeline latency: {self.full_output_pipeline_latency:.2f}ms (LLM: {self.llm_inference_time:.2f}ms, TTS: {self.audio.tts_inference_time:.2f}ms)")
+        # 计算完整输出管道延迟（ChatterboxAudioProcessor没有tts_inference_time属性）
+        estimated_tts_latency = 200.0  # 估计的TTS延迟（毫秒）
+        self.full_output_pipeline_latency = self.llm_inference_time + estimated_tts_latency
+        logger.info(f"🗣️⏱️ Full output pipeline latency: {self.full_output_pipeline_latency:.2f}ms (LLM: {self.llm_inference_time:.2f}ms, TTS: ~{estimated_tts_latency:.2f}ms)")
 
         logger.info("🗣️🚀 SpeechPipelineManager initialized and workers started.")
 
@@ -607,33 +596,33 @@ class SpeechPipelineManager:
                 else:
                     logger.info(f"🗣️👄🎶 [Gen {gen_id}] Quick TTS Worker: Synthesizing: '{current_gen.quick_answer[:50]}...'")
                     
-                    # 根据TTS引擎选择不同的处理方式
-                    if self.tts_engine == "chatterbox":
-                        # Chatterbox特定的处理逻辑
-                        logger.info(f"🗣️👄🎶 [Gen {gen_id}] Using Chatterbox engine for synthesis")
+                    # 使用ChatterboxAudioProcessor进行合成
+                    logger.info(f"🗣️👄🎶 [Gen {gen_id}] Using ChatterboxAudioProcessor for synthesis")
+                    
+                    # 使用异步方法进行合成
+                    import asyncio
+                    try:
+                        # 在新的事件循环中运行异步合成
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
                         
-                        # 准备Chatterbox特定参数
-                        chatterbox_kwargs = {
-                            "generation_string": f"[Gen {gen_id}] Chatterbox Quick"
-                        }
+                        async def run_synthesis():
+                            async for audio_chunk in self.audio.synthesize_text(current_gen.quick_answer):
+                                if self.stop_tts_quick_request_event.is_set():
+                                    logger.info(f"🗣️👄❌ [Gen {gen_id}] Quick synthesis stopped by event")
+                                    return False
+                                try:
+                                    current_gen.audio_chunks.put_nowait(audio_chunk)
+                                except:
+                                    logger.warning(f"🗣️👄⚠️ [Gen {gen_id}] Audio queue full, dropping chunk")
+                            return True
                         
-                        # 检查是否有voice_preset
-                        if hasattr(self, 'voice_preset') and self.voice_preset:
-                            chatterbox_kwargs["voice_preset"] = self.voice_preset
+                        completed = loop.run_until_complete(run_synthesis())
+                        loop.close()
                         
-                        completed = self.audio.synthesize(
-                            current_gen.quick_answer,
-                            current_gen.audio_chunks,
-                            self.stop_tts_quick_request_event,
-                            **chatterbox_kwargs
-                        )
-                    else:
-                        # 原有的处理逻辑
-                        completed = self.audio.synthesize(
-                            current_gen.quick_answer,
-                            current_gen.audio_chunks,
-                            self.stop_tts_quick_request_event # Pass the event for the synthesizer to check
-                        )
+                    except Exception as synthesis_error:
+                        logger.error(f"🗣️👄💥 [Gen {gen_id}] Synthesis error: {synthesis_error}")
+                        completed = False
 
                     if not completed:
                         # Synthesis was stopped by the stop_tts_quick_request_event
@@ -756,33 +745,33 @@ class SpeechPipelineManager:
             try:
                 logger.info(f"🗣️👄🎶 [Gen {gen_id}] Final TTS Worker: Synthesizing remaining text...")
                 
-                # 根据TTS引擎选择不同的处理方式
-                if self.tts_engine == "chatterbox":
-                    # Chatterbox特定的处理逻辑
-                    logger.info(f"🗣️👄🎶 [Gen {gen_id}] Using Chatterbox engine for final synthesis")
+                # 使用ChatterboxAudioProcessor进行最终合成
+                logger.info(f"🗣️👄🎶 [Gen {gen_id}] Using ChatterboxAudioProcessor for final synthesis")
+                
+                # 使用异步方法进行合成
+                import asyncio
+                try:
+                    # 在新的事件循环中运行异步合成
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                     
-                    # 准备Chatterbox特定参数
-                    chatterbox_kwargs = {
-                        "generation_string": f"[Gen {gen_id}] Chatterbox Final"
-                    }
+                    async def run_final_synthesis():
+                        async for audio_chunk in self.audio.synthesize_generator(get_generator()):
+                            if self.stop_tts_final_request_event.is_set():
+                                logger.info(f"🗣️👄❌ [Gen {gen_id}] Final synthesis stopped by event")
+                                return False
+                            try:
+                                current_gen.audio_chunks.put_nowait(audio_chunk)
+                            except:
+                                logger.warning(f"🗣️👄⚠️ [Gen {gen_id}] Audio queue full, dropping chunk")
+                        return True
                     
-                    # 检查是否有voice_preset
-                    if hasattr(self, 'voice_preset') and self.voice_preset:
-                        chatterbox_kwargs["voice_preset"] = self.voice_preset
+                    completed = loop.run_until_complete(run_final_synthesis())
+                    loop.close()
                     
-                    completed = self.audio.synthesize_generator(
-                        get_generator(),
-                        current_gen.audio_chunks,
-                        self.stop_tts_final_request_event,
-                        **chatterbox_kwargs
-                    )
-                else:
-                    # 原有的处理逻辑
-                    completed = self.audio.synthesize_generator(
-                        get_generator(),
-                        current_gen.audio_chunks,
-                        self.stop_tts_final_request_event # Pass the event for the synthesizer to check
-                    )
+                except Exception as synthesis_error:
+                    logger.error(f"🗣️👄💥 [Gen {gen_id}] Final synthesis error: {synthesis_error}")
+                    completed = False
 
                 if not completed:
                      logger.info(f"🗣️👄❌ [Gen {gen_id}] Final TTS Worker: Synthesis stopped via event.")

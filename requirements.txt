@@ -1,7 +1,7 @@
 # speech to text and text to speech
 realtimestt
 chatterbox-streaming
-realtimetts==0.5.5
+
 # webserver dependencies
 fastapi
 uvicorn

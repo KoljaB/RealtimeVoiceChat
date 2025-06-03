@@ -28,27 +28,26 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import HTMLResponse, Response, FileResponse
 
 USE_SSL = False
-TTS_START_ENGINE = "orpheus"
-TTS_START_ENGINE = "kokoro"
-TTS_START_ENGINE = "coqui"
-TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
-TTS_ORPHEUS_MODEL = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
-TTS_CHATTERBOX_MODEL = "ResembleAI/chatterbox"
-TTS_START_ENGINE = "chatterbox"  
-TTS_CHATTERBOX_CHUNK_SIZE = 30  # 针对快速响应优化
 
+# TTS Configuration - 只使用Chatterbox
+TTS_ENGINE = "chatterbox"
+TTS_CHUNK_SIZE = 25  # 针对快速响应优化
+TTS_TEMPERATURE = 0.8
+TTS_CFG_WEIGHT = 0.5
+TTS_EXAGGERATION = 0.5
 
+# LLM Configuration
 LLM_START_PROVIDER = "ollama"
-#LLM_START_MODEL = "qwen3:30b-a3b"h
 LLM_START_MODEL = "qwen3:8b"
-# LLM_START_PROVIDER = "lmstudio"
-# LLM_START_MODEL = "Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q3_K_L.gguf"
 NO_THINK = False
-DIRECT_STREAM = TTS_START_ENGINE=="chatterbox"
+
+# 使用直接流式传输（Chatterbox原生支持）
+DIRECT_STREAM = True
 
 if __name__ == "__main__":
-    logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Starting engine: {Colors.apply(TTS_START_ENGINE).blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} TTS Engine: {Colors.apply(TTS_ENGINE).blue}")
     logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Direct streaming: {Colors.apply('ON' if DIRECT_STREAM else 'OFF').blue}")
+    logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Chunk size: {Colors.apply(str(TTS_CHUNK_SIZE)).blue}")
 
 # Define the maximum allowed size for the incoming audio queue
 try:
@@ -121,17 +120,17 @@ async def lifespan(app: FastAPI):
     logger.info("🖥️▶️ Server starting up")
     # Initialize global components, not connection-specific state
     app.state.SpeechPipelineManager = SpeechPipelineManager(
-        tts_engine=TTS_START_ENGINE,
         llm_provider=LLM_START_PROVIDER,
         llm_model=LLM_START_MODEL,
         no_think=NO_THINK,
-        orpheus_model=TTS_CHATTERBOX_MODEL,
+        tts_chunk_size=TTS_CHUNK_SIZE,
+        tts_temperature=TTS_TEMPERATURE,
     )
 
     app.state.Upsampler = UpsampleOverlap()
     app.state.AudioInputProcessor = AudioInputProcessor(
         LANGUAGE,
-        is_orpheus=TTS_START_ENGINE=="orpheus",
+        is_orpheus=False,  # 不再使用orpheus
         pipeline_latency=app.state.SpeechPipelineManager.full_output_pipeline_latency / 1000, # seconds
     )
     app.state.Aborting = False # Keep this? Its usage isn't clear in the provided snippet. Minimizing changes.
