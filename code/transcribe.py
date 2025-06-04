@@ -103,6 +103,8 @@ class TranscriptionProcessor:
             before_final_sentence: Optional[Callable[[Optional[np.ndarray], Optional[str]], bool]] = None,
             silence_active_callback: Optional[Callable[[bool], None]] = None,
             on_recording_start_callback: Optional[Callable[[], None]] = None,
+            on_speech_start_utterance_callback: Optional[Callable[[], None]] = None, # New callback
+            on_tts_allowed_to_synthesize: Optional[Callable[[], None]] = None, # For TTS allowance
             is_orpheus: bool = False,
             local: bool = True,
             tts_allowed_event: Optional[threading.Event] = None, # Note: This seems unused in the original code provided
@@ -122,6 +124,8 @@ class TranscriptionProcessor:
             before_final_sentence: Callback triggered just before the recorder finalizes transcription. Receives audio copy and current real-time text. Return True to potentially influence recorder behavior (if supported).
             silence_active_callback: Callback triggered when silence detection state changes. Receives boolean (True if silence is active).
             on_recording_start_callback: Callback triggered when the recorder starts recording after silence or wake word.
+            on_speech_start_utterance_callback: Callback triggered when VAD detects start of speech after silence. # New callback doc
+            on_tts_allowed_to_synthesize: Callback triggered when TTS synthesis can proceed.
             is_orpheus: Flag indicating if specific timing adjustments for 'Orpheus' mode should be used.
             local: Flag used by TurnDetection (if enabled) to indicate local vs remote processing context.
             tts_allowed_event: An event that might be set when TTS synthesis is allowed (currently unused in provided logic).
@@ -137,6 +141,7 @@ class TranscriptionProcessor:
         self.before_final_sentence = before_final_sentence
         self.silence_active_callback = silence_active_callback
         self.on_recording_start_callback = on_recording_start_callback
+        self.on_speech_start_utterance_callback = on_speech_start_utterance_callback # Store new callback
         self.is_orpheus = is_orpheus
         self.pipeline_latency = pipeline_latency
         self.recorder: Optional[AudioToTextRecorder | AudioToTextRecorderClient] = None
@@ -154,7 +159,7 @@ class TranscriptionProcessor:
         self.silence_active: bool = False
         self.last_audio_copy: Optional[np.ndarray] = None
 
-        self.on_tts_allowed_to_synthesize: Optional[Callable] = None # Note: Seems unused
+        self.on_tts_allowed_to_synthesize: Optional[Callable] = on_tts_allowed_to_synthesize
 
         self.text_similarity = TextSimilarity(focus='end', n_words=5)
 
@@ -671,6 +676,9 @@ class TranscriptionProcessor:
             self.set_silence(False)
             self.silence_time = 0.0 # Reset silence time
             logger.debug("👂🗣️ Speech detected (stop_silence_detection called). Silence time reset.")
+            if self.on_speech_start_utterance_callback:
+                logger.info("👂🚀 Invoking on_speech_start_utterance_callback.")
+                self.on_speech_start_utterance_callback()
 
 
         def start_recording():
@@ -753,8 +761,7 @@ class TranscriptionProcessor:
         padded_cfg = textwrap.indent(json.dumps(pretty_cfg, indent=2), "    ")
 
         recorder_type = "AudioToTextRecorderClient" if START_STT_SERVER else "AudioToTextRecorder"
-        logger.info(f"👂⚙️ Creating {recorder_type} with params:")
-        print(Colors.apply(padded_cfg).blue) # Use print for formatted JSON as logger might mangle it
+        logger.info(f"👂⚙️ Creating {recorder_type} with params:\n{padded_cfg}") # Changed print to logger.info
 
 
         # --- Instantiate Recorder ---
@@ -789,32 +796,32 @@ class TranscriptionProcessor:
         """
         # 记录音频块信息和元数据
         chunk_size = len(chunk)
-        logger.info(f"👂🔊 接收到音频块，大小: {chunk_size} 字节")
+        logger.info(f"👂🎙️ Feeding audio chunk to RealtimeSTT recorder, size: {chunk_size} bytes.") # Refined message
         
         # 记录元数据信息
         if audio_meta_data:
-            logger.info(f"👂📋 音频元数据: {audio_meta_data}")
+            logger.debug(f"👂📋 Metadata with chunk: {audio_meta_data}") # Changed to debug
             
             # 更新静音时间（如果提供）
             if "speech_end_silence_start" in audio_meta_data:
                 old_silence_time = self.silence_time
                 self.silence_time = audio_meta_data["speech_end_silence_start"]
                 if old_silence_time != self.silence_time:
-                    logger.info(f"👂⏱️ 更新静音时间: {old_silence_time} -> {self.silence_time}")
+                    logger.info(f"👂⏱️ 更新静音时间: {old_silence_time} -> {self.silence_time}") # Kept as info - significant event
         
         if self.recorder and not self.shutdown_performed:
             try:
                 # Check if feed_audio expects metadata and provide if available
                 if START_STT_SERVER:
                      # Client might require metadata in a specific format
-                     logger.info(f"👂➡️ 将音频块传递给STT服务器，大小: {chunk_size} 字节")
+                     # logger.info(f"👂➡️ 将音频块传递给STT服务器，大小: {chunk_size} 字节") # Removed
                      self.recorder.feed_audio(chunk) # Assuming client handles metadata internally or doesn't need it per chunk
                 else:
                      # Local recorder might use metadata if provided
-                     logger.info(f"👂➡️ 将音频块传递给本地录音器，大小: {chunk_size} 字节")
+                     # logger.info(f"👂➡️ 将音频块传递给本地录音器，大小: {chunk_size} 字节") # Removed
                      self.recorder.feed_audio(chunk) # Assuming local handles it similarly for now
 
-                logger.info(f"👂✅ 音频块成功传递给录音器，大小: {chunk_size} 字节")
+                logger.debug(f"👂✅ Chunk successfully fed to recorder, size: {chunk_size} bytes.") # Changed to debug
             except Exception as e:
                 logger.error(f"👂💥 Error feeding audio to recorder: {e}")
                 import traceback

@@ -293,13 +293,16 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 pcm_data = raw[8:]
                 metadata["pcm"] = pcm_data
                 logger.info(f"🖥️🎤 收到音频数据，大小: {len(pcm_data)} 字节")
+                # Log the metadata dictionary itself for inspection (excluding PCM for brevity)
+                metadata_to_log = {k: v for k, v in metadata.items() if k != 'pcm'} # Ensure pcm is excluded
+                logger.debug(f"🖥️📋 Audio metadata from client: {metadata_to_log}")
 
                 # Check queue size before putting data
                 current_qsize = incoming_chunks.qsize()
                 if current_qsize < MAX_AUDIO_QUEUE_SIZE:
                     # Now put only the metadata dict (containing PCM audio) into the processing queue.
                     logger.info(f"🖥️➡️ 将音频数据放入处理队列，队列大小: {current_qsize}/{MAX_AUDIO_QUEUE_SIZE}")
-                    await incoming_chunks.put(metadata)
+                    await incoming_chunks.put(metadata) # metadata now includes pcm
                     logger.debug("🖥️✅ 音频数据成功放入队列")
                 else:
                     # Queue is full, drop the chunk and log a warning
@@ -624,6 +627,10 @@ class TranscriptionCallbacks:
         self.abort_worker_thread = threading.Thread(target=self._abort_worker, name="AbortWorker", daemon=True)
         self.abort_worker_thread.start()
 
+    def on_user_speech_started(self):
+        """Callback invoked when user speech is detected by AudioInputProcessor's chain."""
+        logger.info(f"🎤 {Colors.GREEN}User speech started signal received. Notifying client.{Colors.RESET}")
+        self.message_queue.put_nowait({"type": "user_speech_started"})
 
     def reset_state(self):
         """Resets connection-specific state flags and variables to their initial values."""
@@ -957,17 +964,22 @@ async def websocket_endpoint(ws: WebSocket):
     # Set up callback manager - THIS NOW HOLDS THE CONNECTION-SPECIFIC STATE
     callbacks = TranscriptionCallbacks(app, message_queue)
 
-    # Assign callbacks to the AudioInputProcessor (global component)
-    # These methods within callbacks will now operate on its *instance* state
-    app.state.AudioInputProcessor.realtime_callback = callbacks.on_partial
-    app.state.AudioInputProcessor.transcriber.potential_sentence_end = callbacks.on_potential_sentence
-    app.state.AudioInputProcessor.transcriber.on_tts_allowed_to_synthesize = callbacks.on_tts_allowed_to_synthesize
-    app.state.AudioInputProcessor.transcriber.potential_full_transcription_callback = callbacks.on_potential_final
-    app.state.AudioInputProcessor.transcriber.potential_full_transcription_abort_callback = callbacks.on_potential_abort
-    app.state.AudioInputProcessor.transcriber.full_transcription_callback = callbacks.on_final
-    app.state.AudioInputProcessor.transcriber.before_final_sentence = callbacks.on_before_final
-    app.state.AudioInputProcessor.recording_start_callback = callbacks.on_recording_start
-    app.state.AudioInputProcessor.silence_active_callback = callbacks.on_silence_active
+    # Set all active listeners for the AudioInputProcessor to methods from the current 'callbacks' instance
+    if hasattr(app.state, "AudioInputProcessor") and app.state.AudioInputProcessor:
+        app.state.AudioInputProcessor.set_active_listeners(
+            speech_start_notifier=callbacks.on_user_speech_started,
+            realtime_callback=callbacks.on_partial,
+            potential_sentence_callback=callbacks.on_potential_sentence,
+            tts_allowed_callback=callbacks.on_tts_allowed_to_synthesize,
+            potential_final_callback=callbacks.on_potential_final,
+            potential_abort_callback=callbacks.on_potential_abort,
+            final_transcription_callback=callbacks.on_final,
+            before_final_sentence_callback=callbacks.on_before_final,
+            recording_start_callback=callbacks.on_recording_start,
+            silence_active_callback=callbacks.on_silence_active
+        )
+    else:
+        logger.error("AudioInputProcessor not found in app.state, cannot set active listeners.")
 
     # Assign callback to the SpeechPipelineManager (global component)
     app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
@@ -1000,6 +1012,10 @@ async def websocket_endpoint(ws: WebSocket):
         # Use return_exceptions=True to prevent gather from stopping on first error during cleanup
         await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("🖥️❌ WebSocket session ended.")
+        # Clear all active listeners in AudioInputProcessor for this connection
+        if hasattr(app.state, "AudioInputProcessor") and app.state.AudioInputProcessor:
+            logger.info("🖥️🧹 Clearing all active listeners in AudioInputProcessor for closed connection.")
+            app.state.AudioInputProcessor.clear_active_listeners()
 
 # --------------------------------------------------------------------
 # Entry point
