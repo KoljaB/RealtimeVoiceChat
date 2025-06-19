@@ -17,7 +17,9 @@ const statusDiv = document.getElementById("status");
 const messagesDiv = document.getElementById("messages");
 const speedSlider = document.getElementById("speedSlider");
 speedSlider.disabled = true;  // start disabled
-
+const settingsBtn = document.getElementById("settingsBtn");
+const settingsArea = document.getElementById("settings-area");
+const promptModeSelect = document.getElementById("prompt-mode-select");
 let socket = null;
 let audioContext = null;
 let mediaStream = null;
@@ -353,6 +355,91 @@ document.getElementById("copyBtn").onclick = () => {
     .then(() => console.log("Conversation copied to clipboard"))
     .catch(err => console.error("Copy failed:", err));
 };
+ 
+// Settings Toggle
+settingsBtn.onclick = () => {
+  const isVisible = settingsArea.style.display === "block";
+  settingsArea.style.display = isVisible ? "none" : "block";
+  console.log("Settings area toggled:", !isVisible);
+  // Settings area is now for mode selection
+};
+ 
+// --- Mode Selection Logic ---
+
+async function fetchAndPopulateModes() {
+  console.log("Fetching available modes...");
+  try {
+    const response = await fetch('/get_modes');
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    const data = await response.json();
+    console.log("Modes received:", data);
+
+    promptModeSelect.innerHTML = ''; // Clear existing options
+
+    data.modes.forEach(mode => {
+      const option = document.createElement('option');
+      option.value = mode;
+      option.textContent = mode;
+      promptModeSelect.appendChild(option);
+    });
+
+    // Set the current mode as selected
+    promptModeSelect.value = data.current_mode;
+    console.log("Dropdown populated. Current mode set to:", data.current_mode);
+
+  } catch (error) {
+    console.error("Error fetching or populating modes:", error);
+    statusDiv.textContent = "Error loading modes.";
+    // Optionally add a placeholder option
+    const option = document.createElement('option');
+    option.textContent = "Error loading modes";
+    option.disabled = true;
+    promptModeSelect.appendChild(option);
+  }
+}
+
+promptModeSelect.addEventListener('change', async (event) => {
+  const selectedMode = event.target.value;
+  console.log(`Mode selection changed to: ${selectedMode}`);
+  
+
+  try {
+    const response = await fetch('/set_mode', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ mode: selectedMode }),
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      console.log("Mode set successfully:", result);
+    
+      // Update dropdown selection just in case backend overrides
+      promptModeSelect.value = result.current_mode;
+    } else {
+      const errorText = await response.text();
+      console.error("Failed to set mode:", response.status, errorText);
+      // Revert dropdown if failed? Or fetch modes again? For now, just show error.
+      // fetchAndPopulateModes(); // Re-fetch to be safe
+    }
+  } catch (error) {
+    console.error("Network error setting mode:", error);
+  }
+
+  // Clear status after a delay
+  setTimeout(() => {
+    if (statusDiv.textContent.includes("mode")) {
+        statusDiv.textContent = socket && socket.readyState === WebSocket.OPEN ? "Recording..." : "Stopped.";
+    }
+  }, 3000);
+});
+
+// Fetch modes when the script loads
+fetchAndPopulateModes();
 
 // First render
 renderMessages();

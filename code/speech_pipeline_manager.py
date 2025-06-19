@@ -3,6 +3,8 @@ from typing import Optional, Callable
 import threading
 import logging
 import time
+
+import asyncio 
 from queue import Queue, Empty
 import sys
 
@@ -16,16 +18,8 @@ from colors import Colors
 # (Logging setup)
 logger = logging.getLogger(__name__)
 
-# (Load system prompt)
-try:
-    with open("system_prompt.txt", "r", encoding="utf-8") as f:
-        system_prompt = f.read().strip()
-    logger.info("🗣️📄 System prompt loaded from file.")
-except FileNotFoundError:
-    logger.warning("🗣️📄 system_prompt.txt not found. Using default system prompt.")
-    system_prompt = "You are a helpful assistant."
 
-
+# System prompt loading is now handled within the SpeechPipelineManager class based on modes.
 USE_ORPHEUS_UNCENSORED = False
 
 orpheus_prompt_addon_normal = """
@@ -121,6 +115,8 @@ class SpeechPipelineManager:
     """
     def __init__(
             self,
+            prompt_modes: dict, # Added
+            initial_mode: str, # Added
             tts_engine: str = "kokoro",
             llm_provider: str = "ollama",
             llm_model: str = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF:Q4_K_M",
@@ -131,10 +127,12 @@ class SpeechPipelineManager:
         Initializes the SpeechPipelineManager.
 
         Sets up configuration, instantiates dependencies (AudioProcessor, LLM, etc.),
-        loads system prompts, initializes state variables (queues, events, flags),
+        initializes state variables (queues, events, flags) based on provided prompt modes,
         measures initial inference latencies, and starts the background worker threads.
 
         Args:
+            prompt_modes: A dictionary mapping mode names to their prompt text.
+            initial_mode: The name of the mode to activate initially.
             tts_engine: The TTS engine to use (e.g., "kokoro", "orpheus").
             llm_provider: The LLM backend provider (e.g., "ollama").
             llm_model: The specific LLM model identifier.
@@ -147,10 +145,27 @@ class SpeechPipelineManager:
         self.no_think = no_think
         self.orpheus_model = orpheus_model
 
-        self.system_prompt = system_prompt
+        # --- Prompt Mode State (Initialized from arguments) ---
+        self.prompt_modes = prompt_modes
+        self.current_mode = initial_mode
+        self.system_prompt = self.prompt_modes.get(self.current_mode, "") # Get initial prompt
+        self.prompt_lock = asyncio.Lock()
+
+
+
+        # Validate and log initial prompt state
+        if not self.system_prompt:
+             logger.warning(f"🗣️⚠️ Initial mode '{self.current_mode}' not found in provided prompts or prompt is empty. Using empty system prompt.")
+             # Ensure the mode exists in the dict even if empty, for consistency
+             if self.current_mode not in self.prompt_modes:
+                 self.prompt_modes[self.current_mode] = ""
+        else:
+            logger.info(f"🗣️📝 Initial system prompt mode set to '{self.current_mode}' ({len(self.system_prompt)} chars)")
+
+        # Append Orpheus addon after setting the initial prompt
         if tts_engine == "orpheus":
             self.system_prompt += f"\n{orpheus_prompt_addon}"
-
+            logger.info("🗣️✨ Appended Orpheus emotion tags addon to system prompt.")
         # --- Instance Dependencies ---
         self.audio = AudioProcessor(
             engine=self.tts_engine,
@@ -165,7 +180,7 @@ class SpeechPipelineManager:
             backend=self.llm_provider, # Or your backend
             model=self.llm_model,
             system_prompt=self.system_prompt,
-            no_think=no_think,
+            no_think=self.no_think, # Use self.no_think
         )
         self.llm.prewarm()
         self.llm_inference_time = self.llm.measure_inference_time()
@@ -1102,3 +1117,55 @@ class SpeechPipelineManager:
 
 
         logger.info("🗣️🔌✅ Shutdown complete.")
+
+    # --- Prompt Mode Management Methods ---
+
+    def get_available_modes(self) -> list[str]:
+        """Returns a list of available prompt mode names."""
+        return list(self.prompt_modes.keys())
+
+    async def set_active_mode(self, mode_name: str) -> bool:
+        """
+        Sets the active prompt mode and updates the system prompt.
+
+        Args:
+            mode_name: The name of the mode to activate.
+
+        Returns:
+            True if the mode was set successfully, False otherwise.
+        """
+        async with self.prompt_lock:
+            if mode_name not in self.prompt_modes:
+                logger.warning(f"🗣️⚠️ Attempt to set invalid mode: {mode_name}")
+                return False
+
+            new_prompt_text = self.prompt_modes[mode_name]
+            self.current_mode = mode_name
+            self.system_prompt = new_prompt_text
+
+            # Append Orpheus addon if needed
+            if self.tts_engine == "orpheus":
+                self.system_prompt += f"\n{orpheus_prompt_addon}"
+
+            logger.info(f"🗣️📝 System prompt mode changed to '{self.current_mode}' ({len(self.system_prompt)} chars)")
+
+            # Attempt to update the LLM instance with the new prompt
+            try:
+                self._update_llm_system_prompt(self.system_prompt)
+                logger.info("🗣️🧠 Updated system prompt in LLM instance.")
+            except Exception as e:
+                logger.error(f"🗣️💥 Error updating system prompt in LLM instance: {e}")
+                # Decide if this should cause the mode set to fail? For now, log and continue.
+
+            return True
+
+    def _update_llm_system_prompt(self, new_prompt: str):
+        """Internal method to update the system prompt in the LLM instance."""
+        if hasattr(self.llm, 'set_system_prompt'):
+            # If the LLM class has a dedicated method
+            self.llm.set_system_prompt(new_prompt)
+        elif hasattr(self.llm, 'system_prompt'):
+            # Otherwise, try setting the attribute directly
+            self.llm.system_prompt = new_prompt
+        else:
+            logger.warning("🗣️⚠️ LLM instance does not have 'set_system_prompt' method or 'system_prompt' attribute.")

@@ -12,6 +12,7 @@ from datetime import datetime
 from colors import Colors
 import uvicorn
 import asyncio
+from asyncio import Lock # Import Lock specifically
 import struct
 import json
 import time
@@ -22,25 +23,27 @@ import os # Added for environment variable access
 from typing import Any, Dict, Optional, Callable # Added for type hints in docstrings
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException # Added Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import HTMLResponse, Response, FileResponse
+from starlette.responses import HTMLResponse, Response, FileResponse, JSONResponse
+from pydantic import BaseModel # Added for request body validation
 
 USE_SSL = False
 TTS_START_ENGINE = "orpheus"
 TTS_START_ENGINE = "kokoro"
-TTS_START_ENGINE = "coqui"
+#TTS_START_ENGINE = "coqui"
 TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
 TTS_ORPHEUS_MODEL = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
 
 LLM_START_PROVIDER = "ollama"
 #LLM_START_MODEL = "qwen3:30b-a3b"
-LLM_START_MODEL = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF:Q4_K_M"
+LLM_START_MODEL = "hf.co/mradermacher/Qwen3-30B-A3B-abliterated-i1-GGUF:Q4_K_S"
 # LLM_START_PROVIDER = "lmstudio"
 # LLM_START_MODEL = "Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q3_K_L.gguf"
-NO_THINK = False
+NO_THINK = True
 DIRECT_STREAM = TTS_START_ENGINE=="orpheus"
+
 
 if __name__ == "__main__":
     logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Starting engine: {Colors.apply(TTS_START_ENGINE).blue}")
@@ -115,8 +118,36 @@ async def lifespan(app: FastAPI):
         app: The FastAPI application instance.
     """
     logger.info("🖥️▶️ Server starting up")
+
+# --- Dynamic Prompt Mode Loading ---
+    PROMPT_DIR = "prompts" 
+    DEFAULT_MODE = "conversation" # Define default mode here
+    prompt_modes = {}
+    discovered_modes = []
+    logger.info(f"🖥️📝 Loading prompts from directory: {PROMPT_DIR}")
+
+    for filename in os.listdir(PROMPT_DIR):
+        if filename.endswith(".txt"):
+            mode_name = os.path.splitext(filename)[0]
+            file_path = os.path.join(PROMPT_DIR, filename)
+            with open(file_path, "r", encoding="utf-8") as f:
+                prompt_text = f.read().strip()
+                if prompt_text:
+                    prompt_modes[mode_name] = prompt_text
+                    discovered_modes.append(mode_name)
+                    logger.info(f"   - Loaded '{mode_name}' ({len(prompt_text)} chars) from {file_path}")
+                else:
+                    logger.warning(f"🖥️⚠️ Skipping empty prompt file: {file_path}")
+            
+
+
+
+
+
     # Initialize global components, not connection-specific state
     app.state.SpeechPipelineManager = SpeechPipelineManager(
+        prompt_modes=prompt_modes, 
+        initial_mode=DEFAULT_MODE, 
         tts_engine=TTS_START_ENGINE,
         llm_provider=LLM_START_PROVIDER,
         llm_model=LLM_START_MODEL,
@@ -177,6 +208,38 @@ async def get_index() -> HTMLResponse:
     with open("static/index.html", "r", encoding="utf-8") as f:
         html_content = f.read()
     return HTMLResponse(content=html_content)
+
+
+class ModeUpdateRequest(BaseModel):
+    mode: str
+
+@app.get("/get_modes")
+async def get_modes(request: Request):
+    """API endpoint to get available prompt modes and the current mode."""
+    app_state = request.app.state
+    manager = app_state.SpeechPipelineManager
+    return JSONResponse(content={
+        "modes": manager.get_available_modes(),
+        "current_mode": manager.current_mode # Access the manager's current mode
+    })
+
+@app.post("/set_mode")
+async def set_mode(request: ModeUpdateRequest, fastapi_request: Request):
+    """API endpoint to set the active prompt mode."""
+    app_state = fastapi_request.app.state
+    new_mode = request.mode
+
+    manager = app_state.SpeechPipelineManager
+
+    success = await manager.set_active_mode(new_mode)
+
+    if not success:
+        # The manager already logged the warning
+        raise HTTPException(status_code=400, detail=f"Invalid mode '{new_mode}'. Available modes: {manager.get_available_modes()}")
+
+
+    return JSONResponse(content={"status": "success", "current_mode": manager.current_mode})
+
 
 # --------------------------------------------------------------------
 # Utility functions
