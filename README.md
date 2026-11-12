@@ -1,6 +1,8 @@
 
 # Real-Time AI Voice Chat 🎤💬🧠🔊
 
+<a href="https://hackergit.org/r/KoljaB/RealtimeVoiceChat"><img src="https://hackergit.org/badge/KoljaB/RealtimeVoiceChat.svg?style=rank" alt="Hacker News rank via HackerGit" width="250" height="55"></a>
+
 **Have a natural, spoken conversation with an AI!**  
 
 This project lets you chat with a Large Language Model (LLM) using just your voice, receiving spoken responses in near real-time. Think of it as your own digital conversation partner.
